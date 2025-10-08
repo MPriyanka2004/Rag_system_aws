@@ -1,0 +1,108 @@
+import boto3
+import requests
+from requests_aws4auth import AWS4Auth
+from langchain.prompts import ChatPromptTemplate
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain
+from langchain_community.llms import BedrockLLM
+import logging
+
+# Config
+OPENSEARCH_URL = "https://search-my-rag-domain-xyz123.us-east-1.es.amazonaws.com"
+INDEX_NAME = "rag-index"
+REGION = "us-east-1"
+
+# Logging Setup 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# AWS Clients 
+session = boto3.Session()
+credentials = session.get_credentials()
+awsauth = AWS4Auth(
+    credentials.access_key,
+    credentials.secret_key,
+    REGION,
+    "es",
+    session_token=credentials.token,
+)
+bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+
+# LLM & Memory Setup
+llm = BedrockLLM(
+    model_id="amazon.titan-text-express-v1",  # or "anthropic.claude-v2"
+    client=bedrock_client
+)
+
+# Use LangChain ConversationBufferMemory instead of manual list
+memory = ConversationBufferMemory(memory_key="history", return_messages=True)
+
+# Prompt Template for RAG
+template = """
+You are a helpful assistant. Use the following retrieved context and conversation history to answer clearly.
+
+Retrieved Context:
+{context}
+
+Conversation History:
+{history}
+
+Question:
+{question}
+"""
+
+prompt = ChatPromptTemplate.from_template(template)
+
+# Conversation Chain
+chain = ConversationChain(
+    llm=llm,
+    verbose=True,
+    memory=memory,
+    prompt=prompt
+)
+
+# OpenSearch Retrieval 
+def retrieve_docs(user_text, top_k=3):
+    search_query = {
+        "size": top_k,
+        "query": {"match": {"content": user_text}}
+    }
+    url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+    res = requests.get(url, json=search_query, auth=awsauth)
+    res.raise_for_status()
+    hits = res.json()["hits"]["hits"]
+    return [doc["_source"]["content"] for doc in hits]
+
+# Lambda Handler 
+def lambda_handler(event, context):
+    try:
+        # Parse user input
+        body = event.get("body", {})
+        if isinstance(body, str):
+            import json
+            body = json.loads(body)
+
+        user_text = body.get("prompt", "")
+        if not user_text:
+            return {"statusCode": 400, "body": {"error": "No prompt provided"}}
+
+        # Retrieve docs from OpenSearch
+        docs = retrieve_docs(user_text, top_k=3)
+        context_text = "\n".join(docs)
+
+        # Run the LLM chain (memory automatically handles history)
+        response = chain.predict(context=context_text, question=user_text)
+
+        # Return response
+        return {
+            "statusCode": 200,
+            "body": {
+                "answer": response,
+                "retrieved_context": docs,
+                "conversation_history": memory.load_memory_variables({})["history"]
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error in Lambda: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": {"error": str(e)}}
