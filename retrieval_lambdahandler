@@ -1,0 +1,107 @@
+import boto3
+import requests
+from requests_aws4auth import AWS4Auth
+
+# -------------------------------
+# Config
+# -------------------------------
+OPENSEARCH_URL = "https://search-my-rag-domain-xyz123.us-east-1.es.amazonaws.com"
+INDEX_NAME = "rag-index"
+REGION = "us-east-1"
+
+# -------------------------------
+# AWS Clients
+# -------------------------------
+bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+session = boto3.Session()
+credentials = session.get_credentials()
+awsauth = AWS4Auth(
+    credentials.access_key,
+    credentials.secret_key,
+    REGION,
+    "es",
+    session_token=credentials.token,
+)
+
+# -------------------------------
+# OpenSearch Retrieval
+# -------------------------------
+def retrieve_docs(user_text, top_k=3):
+    search_query = {
+        "size": top_k,
+        "query": {
+            "match": {"content": user_text}
+        }
+    }
+    url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+    res = requests.get(url, json=search_query, auth=awsauth)
+    res.raise_for_status()
+    hits = res.json()["hits"]["hits"]
+    return hits
+
+# -------------------------------
+# Query Bedrock
+# -------------------------------
+def query_bedrock(prompt_obj):
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-v2",
+        body=prompt_obj,  # Pass Python dict directly
+        contentType="application/json"
+    )
+    result = response["body"].read().decode("utf-8")
+    import json
+    return json.loads(result).get("completion", "").strip()
+
+# -------------------------------
+# Lambda Handler
+# -------------------------------
+def lambda_handler(event, context):
+    try:
+        # API Gateway sends body as string
+        body = event.get("body", {})
+        if isinstance(body, str):
+            import json
+            body = json.loads(body)
+
+        user_text = body.get("prompt", "")
+        if not user_text:
+            return {"statusCode": 400, "body": {"error": "No prompt provided"}}
+
+        # Step 1: Retrieve docs from OpenSearch
+        retrieved_docs = retrieve_docs(user_text, top_k=3)
+
+        # Step 2: Build context as Python list
+        context_list = [
+            {
+                "id": doc["_id"],
+                "score": doc["_score"],
+                "content": doc["_source"]["content"]
+            }
+            for doc in retrieved_docs
+        ]
+
+        # Step 3: Build prompt for Bedrock (Python dict)
+        prompt_obj = {
+            "prompt": {
+                "instruction": "You are a helpful assistant. Use the search results to answer clearly.",
+                "search_results": context_list,
+                "question": user_text
+            },
+            "max_tokens_to_sample": 300,
+            "temperature": 0.2
+        }
+
+        # Step 4: Query Bedrock
+        answer = query_bedrock(prompt_obj)
+
+        # Step 5: Return response
+        return {
+            "statusCode": 200,
+            "body": {
+                "answer": answer,
+                "context": context_list
+            }
+        }
+
+    except Exception as e:
+        return {"statusCode": 500, "body": {"error": str(e)}}
