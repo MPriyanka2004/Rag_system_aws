@@ -1,0 +1,79 @@
+import json
+import boto3
+
+def create_bedrock_client():
+    return boto3.client('bedrock-agent')
+
+def get_opensearch_config(vector_store_arn):
+    return {
+        "fieldMapping": {
+            "metadataField": "_source.metadata",
+            "textField": "_source.text",
+            "vectorField": "_source.vector"
+        },
+        "vectorIndexName": "confluence-kb-index",
+        "vectorStoreArn": vector_store_arn
+    }
+
+def get_confluence_config(confluence_host_url, secret_arn):
+    return {
+        "type": "CONFLUENCE",
+        "confluenceConfiguration": {
+            "confluenceVersion": "CLOUD",
+            "hostUrl": confluence_host_url,
+            "authenticationConfiguration": {
+                "basicAuthConfiguration": {
+                    "secretArn": secret_arn
+                }
+            },
+            "crawlAttachments": True,
+            "crawlSpaces": True,
+            "crawlPages": True,
+            "crawlBlogs": False,
+            "pageFilter": {
+                "includes": ["/.*.*/"]
+            }
+        }
+    }
+
+def create_confluence_data_source(client, knowledge_base_id, data_source_config, opensearch_config):
+    response = client.create_data_source(
+        name="confluence-cloud-source",
+        knowledgeBaseId=knowledge_base_id,
+        dataSourceConfiguration=data_source_config,
+        vectorStoreConfiguration={
+            "type": "AMAZON_OPENSEARCH_SERVERLESS",
+            "amazonOpenSearchServerlessConfiguration": opensearch_config
+        },
+        description="Confluence Cloud integration via API"
+    )
+    return response["dataSource"]["dataSourceId"]
+
+def lambda_handler(event, context):
+    # Extract parameters from the event payload
+    knowledge_base_id = event.get("knowledge_base_id")
+    secret_arn = event.get("secret_arn")
+    confluence_host_url = event.get("confluence_host_url")
+    opensearch_arn = event.get("opensearch_arn")
+
+    client = create_bedrock_client()
+    opensearch_config = get_opensearch_config(opensearch_arn)
+    confluence_config = get_confluence_config(confluence_host_url, secret_arn)
+
+    try:
+        data_source_id = create_confluence_data_source(
+            client,
+            knowledge_base_id,
+            confluence_config,
+            opensearch_config
+        )
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'data_source_id': data_source_id})
+        }
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+ 
