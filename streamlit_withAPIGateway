@@ -1,0 +1,91 @@
+import streamlit as st
+import requests
+
+
+
+# -------------------------------
+# Config
+# -------------------------------
+API_URL = "https://your-api-id.execute-api.us-east-1.amazonaws.com/prod/query"  # Lambda via API Gateway
+
+
+
+st.set_page_config(page_title="RAG Query UI", page_icon="💬", layout="centered")
+st.title("RAG Query UI")
+st.caption("Ask a question and get an answer from Lambda + OpenSearch + Bedrock")
+
+
+
+# -------------------------------
+# Session state for chat history
+# -------------------------------
+if "messages" not in st.session_state:
+   st.session_state.messages = []
+
+
+
+if st.session_state.messages:
+   st.write("### History")
+   for m in st.session_state.messages:
+       with st.chat_message(m["role"]):
+           st.write(m["content"])
+
+
+
+# -------------------------------
+# User input
+# -------------------------------
+user_text = st.text_area("Your question", key="user_text", height=120)
+
+
+
+col1, col2 = st.columns([1,1])
+with col1:
+   send_clicked = st.button("Send", type="primary", use_container_width=True, disabled=not bool(user_text.strip()))
+with col2:
+   clear_clicked = st.button("Clear", use_container_width=True)
+
+
+
+if clear_clicked:
+   st.session_state.messages = []
+   st.rerun()
+
+
+
+# -------------------------------
+# Call Lambda via API Gateway
+# -------------------------------
+if send_clicked and user_text.strip():
+   st.session_state.messages.append({"role": "user", "content": user_text.strip()})
+
+
+
+   with st.spinner("Fetching answer from Lambda…"):
+       try:
+           payload = {"prompt": user_text.strip()}
+           response = requests.post(API_URL, json=payload)
+
+
+
+           if response.status_code == 200:
+               data = response.json()
+               answer = data.get("answer", "No answer returned")
+               st.session_state.messages.append({"role": "assistant", "content": answer})
+
+
+
+               # Optional: show retrieved context
+               with st.expander("🔍 Retrieved Context"):
+                   st.json(data.get("context", []))
+           else:
+               st.error(f"Error {response.status_code}: {response.text}")
+
+
+
+       except Exception as e:
+           st.session_state.messages.append({"role": "assistant", "content": f"Error: {e}"})
+
+
+
+   st.rerun()
