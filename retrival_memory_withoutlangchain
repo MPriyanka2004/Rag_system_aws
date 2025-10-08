@@ -1,0 +1,120 @@
+import boto3
+import requests
+from requests_aws4auth import AWS4Auth
+import logging
+
+# Config
+OPENSEARCH_URL = "https://search-my-rag-domain-xyz123.us-east-1.es.amazonaws.com"
+INDEX_NAME = "rag-index"
+REGION = "us-east-1"
+
+# Logging Setup
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# AWS Clients
+session = boto3.Session()
+credentials = session.get_credentials()
+awsauth = AWS4Auth(
+    credentials.access_key,
+    credentials.secret_key,
+    REGION,
+    "es",
+    session_token=credentials.token,
+)
+
+bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+
+# Conversation Memory (DIY)
+#A module-level Python list used to store prior user and assistant messages.
+conversation_history = []   # list of {"role": "user/assistant", "content": "..."}
+
+# OpenSearch Retrieval
+def retrieve_docs(user_text, top_k=3):
+    search_query = {
+        "size": top_k,
+        "query": {"match": {"content": user_text}}
+    }
+    url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+    res = requests.get(url, json=search_query, auth=awsauth)
+    res.raise_for_status()
+    hits = res.json()["hits"]["hits"]
+    return [doc["_source"]["content"] for doc in hits]
+
+# Query Bedrock
+def query_bedrock(user_text, retrieved_context):
+    history_text = "\n".join(
+        [f"{m['role'].capitalize()}: {m['content']}" for m in conversation_history]
+    )
+
+    final_prompt = f"""
+You are a helpful assistant. 
+Use the following retrieved context and conversation history to answer.
+
+Retrieved Context:
+{retrieved_context}
+
+Conversation History:
+{history_text}
+
+User Question:
+{user_text}
+
+Answer:
+"""
+
+    logger.info(f"Final Prompt Sent to LLM:\n{final_prompt}")
+
+    body = {
+        "prompt": final_prompt,
+        "max_tokens_to_sample": 300,
+        "temperature": 0.2
+    }
+
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-v2",   # or amazon.titan-text-express-v1
+        body=body,  # Send dict directly
+        contentType="application/json"
+    )
+
+    result = response["body"].read().decode("utf-8")
+    import json
+    answer = json.loads(result).get("completion", "").strip()
+    return answer
+
+# Lambda Handler
+def lambda_handler(event, context):
+    try:
+        body = event.get("body", {})
+        if isinstance(body, str):
+            import json
+            body = json.loads(body)
+
+        user_text = body.get("prompt", "")
+        if not user_text:
+            return {"statusCode": 400, "body": {"error": "No prompt provided"}}
+
+        # Retrieve docs
+        docs = retrieve_docs(user_text, top_k=3)
+        context_text = "\n".join(docs)
+
+        # Query LLM
+        answer = query_bedrock(user_text, context_text)
+
+        # Update memory
+        conversation_history.append({"role": "user", "content": user_text})
+        conversation_history.append({"role": "assistant", "content": answer})
+
+        # Return response directly as dict
+        return {
+            "statusCode": 200,
+            "body": {
+                "answer": answer,
+                "retrieved_context": docs,
+                "conversation_history": conversation_history
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": {"error": str(e)}}
