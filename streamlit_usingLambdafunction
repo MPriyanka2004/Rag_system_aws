@@ -1,0 +1,75 @@
+import streamlit as st
+import boto3
+import json
+ 
+# -------------------------------
+# Config
+# -------------------------------
+LAMBDA_FUNCTION_NAME = "your-lambda-function-name"  
+REGION = "us-east-1"  
+ 
+# Initialize boto3 Lambda client
+lambda_client = boto3.client("lambda", region_name=REGION)
+ 
+st.set_page_config(page_title="RAG Query UI", page_icon="💬", layout="centered")
+st.title("RAG Query UI")
+st.caption("Ask a question and get an answer from Lambda + OpenSearch + Bedrock")
+ 
+# -------------------------------
+# Session state for chat history
+# -------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+ 
+if st.session_state.messages:
+    st.write("### History")
+    for m in st.session_state.messages:
+        with st.chat_message(m["role"]):
+            st.write(m["content"])
+ 
+# -------------------------------
+# User input
+# -------------------------------
+user_text = st.text_area("Your question", key="user_text", height=120)
+ 
+col1, col2 = st.columns([1,1])
+with col1:
+    send_clicked = st.button("Send", type="primary", use_container_width=True, disabled=not bool(user_text.strip()))
+with col2:
+    clear_clicked = st.button("Clear", use_container_width=True)
+ 
+if clear_clicked:
+    st.session_state.messages = []
+    st.rerun()
+ 
+# -------------------------------
+# Call Lambda via boto3
+# -------------------------------
+if send_clicked and user_text.strip():
+    st.session_state.messages.append({"role": "user", "content": user_text.strip()})
+ 
+    with st.spinner("Fetching answer from Lambda…"):
+        try:
+            payload = {"prompt": user_text.strip()}
+ 
+            # Invoke Lambda
+            response = lambda_client.invoke(
+                FunctionName=LAMBDA_FUNCTION_NAME,
+                InvocationType="RequestResponse",
+                Payload=json.dumps(payload)
+            )
+ 
+            # Read response
+            result = json.loads(response["Payload"].read())
+            answer = result.get("answer", "No answer returned")
+ 
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+ 
+            # Optional: show retrieved context
+            with st.expander("🔍 Retrieved Context"):
+                st.json(result.get("context", []))
+ 
+        except Exception as e:
+            st.session_state.messages.append({"role": "assistant", "content": f"Error: {e}"})
+ 
+    st.rerun()
