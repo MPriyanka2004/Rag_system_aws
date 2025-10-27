@@ -1,0 +1,127 @@
+import boto3
+import requests
+import json
+import logging
+from requests_aws4auth import AWS4Auth
+from langchain_community.llms import BedrockLLM
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains import ConversationChain
+
+# Config
+OPENSEARCH_URL = "https://search-my-rag-domain-xyz123.us-east-1.es.amazonaws.com"
+INDEX_NAME = "rag-index"
+REGION = "us-east-1"
+TABLE_NAME = "ChatMemoryTable"
+
+# Logging Setup
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# AWS Clients
+session = boto3.Session()
+credentials = session.get_credentials()
+
+awsauth = AWS4Auth(
+    credentials.access_key,
+    credentials.secret_key,
+    REGION,
+    "es",
+    session_token=credentials.token,
+)
+bedrock_client = boto3.client("bedrock-runtime", region_name=REGION)
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+table = dynamodb.Table(TABLE_NAME)
+
+# LLM Setup
+llm = BedrockLLM(
+    model_id="amazon.titan-text-express-v1",
+    client=bedrock_client
+)
+
+# Prompt Template
+template = """
+You are a helpful assistant. Use the following context and chat history to answer clearly.
+
+Retrieved Context:
+{context}
+
+Conversation History:
+{history}
+
+User Question:
+{question}
+"""
+prompt = ChatPromptTemplate.from_template(template)
+
+# Helper: Retrieve from OpenSearch
+def retrieve_docs(user_text, top_k=3):
+    search_query = {
+        "size": top_k,
+        "query": {"match": {"content": user_text}}
+    }
+    url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+    res = requests.get(url, json=search_query, auth=awsauth)
+    res.raise_for_status()
+    hits = res.json()["hits"]["hits"]
+    return [doc["_source"]["content"] for doc in hits]
+
+# Helper: Get Chat History from DynamoDB
+def get_chat_history(session_id):
+    response = table.get_item(Key={"SessionId": session_id})
+    if "Item" in response:
+        return response["Item"].get("History", "")
+    return ""
+
+# Helper: Save Chat History to DynamoDB
+def save_chat_history(session_id, history):
+    table.put_item(Item={
+        "SessionId": session_id,
+        "History": history
+    })
+
+# Lambda Handler
+def lambda_handler(event, context):
+    try:
+        # Parse user input
+        body = event.get("body", {})
+        if isinstance(body, str):
+            body = json.loads(body)
+
+        user_text = body.get("prompt", "")
+        session_id = body.get("session_id", "default-session")
+
+        if not user_text:
+            return {"statusCode": 400, "body": json.dumps({"error": "No prompt provided"})}
+
+        # Retrieve previous history
+        history = get_chat_history(session_id)
+
+        # Retrieve documents from OpenSearch
+        docs = retrieve_docs(user_text, top_k=3)
+        context_text = "\n".join(docs)
+
+        # Format the prompt with existing history
+        final_prompt = template.format(context=context_text, history=history, question=user_text)
+
+        # Get response from LLM
+        response = llm.invoke(final_prompt)
+
+        # Update chat history
+        new_history = f"{history}\nUser: {user_text}\nAssistant: {response}"
+
+        # Save updated history to DynamoDB
+        save_chat_history(session_id, new_history)
+
+        # Return response
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "answer": response,
+                "retrieved_context": docs,
+                "conversation_history": new_history
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Error in Lambda: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"error": str(e)})}
